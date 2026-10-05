@@ -1,0 +1,14 @@
+{
+  "id": "vis-ct-quant",
+  "name": "CT 臓器体積・体組成",
+  "version": "0.1.0",
+  "engines": { "graphy": ">0.4.0", "os": ["win32", "darwin", "linux"] },
+  "description": "Segment a CT series into 117 structures with TotalSegmentator (task total, Apache-2.0 weights) on an external GPU such as Google Colab, then measure organ volumes, CT values and muscle areas at the L3 level with GRAPHY-Next (H66). Saves DICOM SEG, SR and CSV. Research use only - not a diagnostic device.",
+  "author": "Visionary Imaging Services, Inc.",
+  "homepage": "https://github.com/tatsunidas/graphy-next-plugin-ct-quant",
+  "license": "MIT",
+  "contributes": ["viewer2d.menu.analysis"],
+  "category": "ai",
+  "ui": "ui.js",
+  "permissions": ["remote-compute"]
+}

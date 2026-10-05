@@ -1,0 +1,96 @@
+# タグ v<version> を push すると、vis-ct-quant-<version>.zip / .sha256 / .minisig / minisign.pub を
+# 作って GitHub Release に添付する。GRAPHY-Next のプラグインマネージャはこの zip 資産
+# （直下に plugin.json）を取得・検証・展開する。
+#
+# 雛形: GRAPHY-Next の examples/plugin-template/.github/workflows/release.yml
+# 配布と検証の設計: GRAPHY-Next の fw/plugin-manager-design.md §2 / §5.1 / §5.2、署名は fw/plugin-signing-runbook.md §6
+name: Release plugin
+
+on:
+  push:
+    tags: ["v*"]
+  # 手動実行は署名と検証までの dry-run（Release は作らない）。secrets の登録確認に使う。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    # ステップ内 env は同じステップの if から参照できないため、ジョブレベルで公開する。
+    env:
+      MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ui.js はビルドなしの 1 ファイル。純関数と、計算機の上のコード（PY）の検査をテストで通す
+      - name: Test
+        run: npm run verify
+
+      - name: Resolve id / version
+        id: meta
+        run: |
+          id=$(jq -r .id plugin.json)
+          pjver=$(jq -r .version plugin.json)
+          ver="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            ver="$pjver"
+          elif [ "$pjver" != "$ver" ]; then
+            echo "::error::plugin.json version ($pjver) != tag ($ver). 版とタグを一致させてください。"
+            exit 1
+          fi
+          echo "id=$id"   >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Package zip (+ sha256)
+        run: |
+          name="${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}"
+          mkdir -p pkg dist
+          cp plugin.json ui.js pkg/
+          (cd pkg && zip -r "../dist/$name.zip" .)     # 直下に plugin.json を置く（マネージャの前提）
+          (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
+          ls -la dist
+
+      # 公式鍵（98EA7C6BA2D50118）で署名する。署名があると本体の trusted-keys で検証が通り、
+      # 利用者の導入は確認画面なしになる。
+      # 🔴 公式プラグインは**署名なしで公開しない**: 鍵が登録されていなければリリースを止める
+      #    （署名なしでも導入はできてしまうので、「公式なのに確認画面が出る」配布物を黙って出さない）。
+      #    パスフレーズの無い鍵（minisign -W で作ったもの）なら MINISIGN_PASSWORD は空でよい。
+      - name: Sign package
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::secrets.MINISIGN_SECRET_KEY がありません（fw/plugin-signing-runbook.md §6）。公式プラグインは署名なしで公開しません。"
+            exit 1
+          fi
+          if [ ! -f minisign.pub ]; then
+            echo "::error::minisign.pub がリポジトリにありません"
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          name="${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}"
+          printf '%s' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s /tmp/minisign.key \
+            -m "dist/$name.zip" -t "$name" -x "dist/$name.zip.minisig"
+          rm -f /tmp/minisign.key
+          cp minisign.pub dist/
+          # 🔴 自分の公開鍵で検証できることを**公開する前に**確かめる。
+          minisign -V -p minisign.pub -m "dist/$name.zip" -x "dist/$name.zip.minisig"
+          ls -la dist
+
+      # 本体と同じく公開はせず下書きを作る。下書きの zip を現行の公開版の本体に入れて確かめてから、
+      # 人が `gh release edit vX.Y.Z --draft=false` で公開する（下書きは利用者の本体からは見えない）。
+      - name: Create release (draft)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip
+            dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip.sha256
+            dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip.minisig
+            dist/minisign.pub

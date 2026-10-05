@@ -1,0 +1,9 @@
+{
+  "name": "graphy-next-plugin-ct-quant",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "verify": "node --test"
+  }
+}
