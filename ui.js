@@ -132,13 +132,17 @@ from totalsegmentator.python_api import totalsegmentator
 from totalsegmentator.map_to_binary import class_map
 args = json.load(open(sys.argv[1], encoding='utf-8'))
 totalsegmentator(args['input'], args['output'], ml=True, task='total', fast=args['fast'], quiet=True)
+# 椎体だけ（椎弓を含まない）。L1 椎体の CT 値に使う。v2.18.0 ではライセンス不要（commercial_models に無い）
+totalsegmentator(args['input'], args['bodies'], ml=True, task='vertebrae_body', quiet=True)
 json.dump({'peakMiB': round(torch.cuda.max_memory_allocated() / 1048576),
            'gpu': torch.cuda.get_device_name(0),
-           'classMap': {str(k): v for k, v in class_map['total'].items()}}, open(sys.argv[2], 'w'))
+           'classMap': {str(k): v for k, v in class_map['total'].items()},
+           'bodyMap': {str(k): v for k, v in class_map['vertebrae_body'].items()}}, open(sys.argv[2], 'w'))
 '''
 args_path = os.path.join(work, 'run-args.json')
 info_path = os.path.join(work, 'run-info.json')
-json.dump({'input': image_path, 'output': out_path, 'fast': FAST}, open(args_path, 'w', encoding='utf-8'))
+bodies_path = os.path.join(work, 'bodies.nii.gz')
+json.dump({'input': image_path, 'output': out_path, 'bodies': bodies_path, 'fast': FAST}, open(args_path, 'w', encoding='utf-8'))
 proc = subprocess.run([sys.executable, '-c', RUNNER, args_path, info_path], capture_output=True, encoding='utf-8', errors='replace',
                       env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
 if proc.stdout:
@@ -151,14 +155,15 @@ if proc.returncode != 0:
 info = json.load(open(info_path))
 stage('inferred', 0.85)
 
-o = nib.load(out_path)
-lab = np.rint(np.asanyarray(o.dataobj)).astype(np.int32)
-if lab.ndim != 3:
-    raise RuntimeError('unexpected-output-shape: ' + str(lab.shape))
-# 出力の格子 → 入力の格子（同じなら写すだけ。違えば最近傍で取り直す）
-m = np.linalg.inv(o.affine) @ ras
-resampled = not (lab.shape == (nx, ny, nz) and np.allclose(m, np.eye(4), atol=1e-3))
-if resampled:
+def to_input_grid(path):
+    """出力の格子 → 入力の格子（同じなら写すだけ。違えば最近傍で取り直す）。戻りは [x, y, z] と、取り直したか。"""
+    o = nib.load(path)
+    lab = np.rint(np.asanyarray(o.dataobj)).astype(np.int32)
+    if lab.ndim != 3:
+        raise RuntimeError('unexpected-output-shape: ' + str(lab.shape))
+    m = np.linalg.inv(o.affine) @ ras
+    if lab.shape == (nx, ny, nz) and np.allclose(m, np.eye(4), atol=1e-3):
+        return lab, False
     res = np.zeros((nx, ny, nz), np.int32)
     ii, jj = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
     for k in range(nz):
@@ -168,7 +173,16 @@ if resampled:
         v = np.zeros(ii.size, np.int32)
         v[inside] = lab[q[0, inside], q[1, inside], q[2, inside]]
         res[:, :, k] = v.reshape(nx, ny)
-    lab = res
+    return res, True
+
+
+lab, resampled = to_input_grid(out_path)
+bodies, resampled_b = to_input_grid(bodies_path)
+# L1 椎体 = total の vertebrae_L1（椎骨全体）と vertebrae_body の椎体が重なるところ
+l1_id = {v: int(k) for k, v in info['classMap'].items()}.get('vertebrae_L1')
+body_id = {v: int(k) for k, v in info['bodyMap'].items()}['vertebrae_body']
+l1body = ((lab == l1_id) & (bodies == body_id)) if l1_id is not None else np.zeros(lab.shape, bool)
+np.save('outputs/l1body.npy', np.ascontiguousarray(l1body.transpose(2, 1, 0)).astype(np.uint8))
 zyx = np.ascontiguousarray(lab.transpose(2, 1, 0))
 np.save('outputs/labels.npy', zyx.astype(np.uint8 if zyx.max() < 256 else np.uint16))
 values, counts = np.unique(zyx, return_counts=True)
@@ -182,7 +196,8 @@ json.dump({
     'labels': {str(int(v)): int(c) for v, c in zip(values, counts)},
     'shape': [int(nz), int(ny), int(nx)],
     'geometry': {'spacing': sp.tolist(), 'origin': org.tolist(), 'direction': dr.tolist()},
-    'resampled': bool(resampled),
+    'resampled': bool(resampled or resampled_b),
+    'l1BodyVoxels': int(l1body.sum()),
     'stages': STAGES,
     'gpu': {'name': info['gpu'], 'peakMiB': info['peakMiB']},
 }, open('outputs/labels.json', 'w', encoding='utf-8'), ensure_ascii=False)
@@ -392,6 +407,18 @@ export function liverSpleen(measurements, classMap) {
 }
 
 /**
+ * 椎骨が撮影範囲の端で切れているか。すぐ上とすぐ下の椎骨がどちらも写っていれば、間に収まっている。
+ * どちらかが無いときだけ、ラベルが端のスライスに触れているかで見る（理由は l3Slice の説明）。
+ * @param {{ kRange: [number, number] }} m H66 の結果
+ * @param {number} nz
+ * @param {{ above: boolean, below: boolean }} neighbours
+ */
+export function vertebraCut(m, nz, neighbours) {
+  const touches = m.kRange[0] === 0 || m.kRange[1] === nz - 1;
+  return touches && !(neighbours.above && neighbours.below);
+}
+
+/**
  * L3 のスライスを決める: `vertebrae_L3` の重心に最も近い格子のスライス。
  *
  * 撮影範囲で切れていれば重心が本当の高さとずれるので測らない。切れているかは、すぐ上の L2 とすぐ下の L4 が
@@ -406,8 +433,7 @@ export function liverSpleen(measurements, classMap) {
 export function l3Slice(l3, vol, neighbours = { l2: false, l4: false }) {
   if (!l3) return { ok: false, reason: "L3 椎体が見つかりませんでした（撮影範囲に入っていないか、認識できませんでした）" };
   const nz = vol.dims[2];
-  const touches = l3.kRange[0] === 0 || l3.kRange[1] === nz - 1;
-  if (touches && !(neighbours.l2 && neighbours.l4)) {
+  if (vertebraCut(l3, nz, { above: neighbours.l2, below: neighbours.l4 })) {
     return { ok: false, reason: "L3 椎体が撮影範囲の端で切れています（L2・L4 の片方が写っておらず、重心が本当の高さとずれるので測りません）" };
   }
   const w = vol.worldToIndex;
@@ -415,6 +441,31 @@ export function l3Slice(l3, vol, neighbours = { l2: false, l4: false }) {
   const k = Math.round(w[8] * x + w[9] * y + w[10] * z + w[11]);
   if (k < 0 || k >= nz) return { ok: false, reason: "L3 の高さが格子の外に出ました" };
   return { ok: true, k };
+}
+
+/**
+ * L1 椎体（vertebrae_body と vertebrae_L1 の重なり）の CT 値。骨密度への換算や閾値での判定はしない。
+ * 椎骨が撮影範囲で切れていれば出さない（切れた椎体の平均は別の部位の平均になる）。
+ * @param {any | undefined} body H66 の結果（L1 椎体のマスク・ラベル 1）
+ * @param {any | undefined} l1 H66 の結果（total の vertebrae_L1。切れているかの判定に使う）
+ * @param {number} nz
+ * @param {{ t12: boolean, l2: boolean }} neighbours
+ * @returns {{ ok: true, volumeMl: number, voxelCount: number, meanHu: number, sdHu: number, erodedMeanHu: number, erodedVoxels: number } | { ok: false, reason: string }}
+ */
+export function l1BodyRow(body, l1, nz, neighbours) {
+  if (!l1 || !body || body.voxelCount === 0) return { ok: false, reason: "L1 椎体が見つかりませんでした（撮影範囲に入っていないか、認識できませんでした）" };
+  if (vertebraCut(l1, nz, { above: neighbours.t12, below: neighbours.l2 })) {
+    return { ok: false, reason: "L1 が撮影範囲の端で切れています（T12・L2 の片方が写っていないので測りません）" };
+  }
+  return {
+    ok: true,
+    volumeMl: body.volumeMl,
+    voxelCount: body.voxelCount,
+    meanHu: body.stats?.mean ?? NaN,
+    sdHu: body.stats?.sd ?? NaN,
+    erodedMeanHu: body.eroded?.mean ?? NaN,
+    erodedVoxels: body.eroded?.n ?? 0,
+  };
 }
 
 /**
@@ -452,7 +503,7 @@ const fmt = (v, d = 1) => (Number.isFinite(v) ? v.toFixed(d) : "");
  * @param {ReturnType<typeof l3Muscles> | null} l3
  * @param {{ model: string, version: string, fast: boolean, seriesLabel: string, l3k: number | null, heightCm: number | null }} meta
  */
-export function toCsv(organs, ls, l3, meta) {
+export function toCsv(organs, ls, l3, meta, l1 = null) {
   const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
   const lines = [
     `# ${meta.model} ${meta.version}${meta.fast ? " (fast)" : ""} / ${meta.seriesLabel} / research use only`,
@@ -460,6 +511,7 @@ export function toCsv(organs, ls, l3, meta) {
     ...organs.map((r) => ["organ", q(r.name), fmt(r.volumeMl, 2), fmt(r.meanHu), fmt(r.sdHu), fmt(r.erodedMeanHu), "", "", ""].join(",")),
     ["liver_spleen", q("liver - spleen (HU)"), "", fmt(ls.liverMinusSpleenHu), "", "", "", "", ""].join(","),
     ...(l3 ?? []).map((r) => ["L3", q(r.name), "", fmt(r.meanHu), "", "", fmt(r.areaCm2, 2), fmt(r.muscleRangeAreaCm2, 2), fmt(r.indexCm2PerM2, 2)].join(",")),
+    ...(l1 && l1.ok ? [["L1", q("L1 vertebral body"), fmt(l1.volumeMl, 2), fmt(l1.meanHu), fmt(l1.sdHu), fmt(l1.erodedMeanHu), "", "", ""].join(",")] : []),
   ];
   if (meta.l3k != null) lines.push(`# L3 slice index k=${meta.l3k}${meta.heightCm ? ` / height ${meta.heightCm} cm` : ""}`);
   return "﻿" + lines.join("\r\n") + "\r\n";
@@ -471,7 +523,7 @@ export function toCsv(organs, ls, l3, meta) {
  * @param {ReturnType<typeof l3Muscles> | null} l3
  * @param {{ seriesUid: string }} target
  */
-export function srGroups(organs, l3, target) {
+export function srGroups(organs, l3, target, l1 = null) {
   const HU = "[hnsf'U]";
   const groups = [];
   for (const r of organs) {
@@ -485,6 +537,11 @@ export function srGroups(organs, l3, target) {
     const measurements = [{ type: "area", value: r.areaCm2, unit: "cm2" }];
     if (Number.isFinite(r.meanHu)) measurements.push({ type: "meanValue", value: r.meanHu, unit: HU });
     groups.push({ trackingId: `L3 ${r.name}`, findingText: `L3 level: ${r.name}`, seriesInstanceUid: target.seriesUid, measurements });
+  }
+  if (l1 && l1.ok && Number.isFinite(l1.meanHu)) {
+    const measurements = [{ type: "meanValue", value: l1.meanHu, unit: HU }];
+    if (Number.isFinite(l1.sdHu)) measurements.push({ type: "stdDev", value: l1.sdHu, unit: HU });
+    groups.push({ trackingId: "L1 vertebral body", findingText: `L1 vertebral body (no BMD conversion). Mean excluding 1-voxel border: ${fmt(l1.erodedMeanHu)} HU`, seriesInstanceUid: target.seriesUid, measurements });
   }
   return groups;
 }
@@ -526,7 +583,7 @@ export async function activate(host) {
   const height = el("input", { type: "number", min: "50", max: "250", step: "0.1", placeholder: "身長 cm（任意）", testid: "ctq-height", style: "width: 9em" });
   const status = el("div", { testid: "ctq-status", style: "color: #52606d; min-height: 1.2em" });
   const tabs = el("div", { style: "display: none; gap: 4px" });
-  const panes = { organs: el("div", { testid: "ctq-organs" }), liver: el("div", { testid: "ctq-liver" }), l3: el("div", { testid: "ctq-l3" }) };
+  const panes = { organs: el("div", { testid: "ctq-organs" }), liver: el("div", { testid: "ctq-liver" }), l3: el("div", { testid: "ctq-l3" }), bone: el("div", { testid: "ctq-bone" }) };
   const saveRow = el("div", { style: "display: none; gap: 6px; flex-wrap: wrap" });
   const result = el("div", { testid: "ctq-result" });
   const cell = "padding: 2px 8px; border-bottom: 1px solid #e6eaee";
@@ -542,9 +599,9 @@ export async function activate(host) {
     el("div", { style: "font-size: 11px; color: #52606d" },
       `「実行」で、匿名化したこのシリーズを外部の計算機へ送り、TotalSegmentator ${TOTALSEG_VERSION}（total・重みは Apache-2.0）で 117 の構造に分けます。` +
       "体積と CT 値は本体が測ります（H66）。"),
-    status, tabs, panes.organs, panes.liver, panes.l3, saveRow, result,
+    status, tabs, panes.organs, panes.liver, panes.l3, panes.bone, saveRow, result,
   );
-  const tabBtns = /** @type {Array<[keyof typeof panes, string]>} */ ([["organs", "臓器"], ["liver", "肝・脾"], ["l3", "L3"]]).map(([key, label]) => {
+  const tabBtns = /** @type {Array<[keyof typeof panes, string]>} */ ([["organs", "臓器"], ["liver", "肝・脾"], ["l3", "L3"], ["bone", "L1 椎体"]]).map(([key, label]) => {
     const b = el("button", { textContent: label, testid: `ctq-tab-${key}` });
     b.addEventListener("click", () => showTab(key));
     return b;
@@ -553,7 +610,7 @@ export async function activate(host) {
   /** @param {keyof typeof panes} key */
   function showTab(key) {
     for (const [k, p] of Object.entries(panes)) p.style.display = k === key ? "block" : "none";
-    tabBtns.forEach((b, i) => { b.style.fontWeight = ["organs", "liver", "l3"][i] === key ? "bold" : "normal"; });
+    tabBtns.forEach((b, i) => { b.style.fontWeight = ["organs", "liver", "l3", "bone"][i] === key ? "bold" : "normal"; });
   }
   Object.values(panes).forEach((p) => { p.style.display = "none"; });
 
@@ -611,6 +668,16 @@ export async function activate(host) {
   }
   height.addEventListener("input", () => { if (state.l3) renderL3(); });
 
+  function renderBone() {
+    const r = state.l1;
+    if (!r.ok) { panes.bone.replaceChildren(el("div", { testid: "ctq-l1-unavailable", textContent: r.reason, style: "color: #b42318" })); return; }
+    panes.bone.replaceChildren(
+      table(["", "体積 mL", "平均 HU", "SD HU", "平均 HU（境界 1 ボクセルを除く）"], [["L1 椎体", fmt(r.volumeMl, 1), fmt(r.meanHu), fmt(r.sdHu), fmt(r.erodedMeanHu)]]),
+      el("div", { style: "font-size: 11px; color: #8a4b00", textContent:
+        "椎体（椎弓を含まない・TotalSegmentator vertebrae_body）と L1 の重なりの平均 CT 値です。骨密度（mg/cm³）への換算や、基準値による判定はしていません。" +
+        "文献の測り方（椎体中央の海綿骨に置いた ROI）とは範囲が違います（皮質骨を含みます。境界を除いた値も参考に）。造影 CT では値が上がります。" }));
+  }
+
   /** L3 のスライスに、大腰筋・脊柱起立筋だけを色で重ねる（目で確かめるため）。 */
   function drawSlice(canvas, k) {
     const { data, vol } = state.labels;
@@ -661,8 +728,8 @@ export async function activate(host) {
       busy(false);
       return;
     }
-    const [lj, ln] = await Promise.all([r.readFile("labels.json"), r.readFile("labels.npy")]);
-    if (!lj || !ln) { setStatus("失敗: 結果が返りませんでした"); busy(false); return; }
+    const [lj, ln, lb] = await Promise.all([r.readFile("labels.json"), r.readFile("labels.npy"), r.readFile("l1body.npy")]);
+    if (!lj || !ln || !lb) { setStatus("失敗: 結果が返りませんでした"); busy(false); return; }
     const summary = JSON.parse(new TextDecoder().decode(lj));
     const npy = parseNpy(ln);
     setStatus("ボリュームを読み込んでいます…");
@@ -690,7 +757,13 @@ export async function activate(host) {
         valueRanges: [MUSCLE_HU],
       });
     }
-    renderOrgans(); renderLiver(); renderL3();
+    // L1 椎体（別のマスク・ラベル 1）。同じ格子の対応で写す
+    const body = reorderLabels(/** @type {any} */ (parseNpy(lb).data), mapped.kMap, vol.dims[0] * vol.dims[1]);
+    const [bodyMeasure] = host.measureLabels({ data: body, dims: vol.dims, indexToWorld: vol.indexToWorld }, vol, { erodeVoxels: 1 });
+    state.l1BodyMeasure = bodyMeasure ?? null;
+    state.l1 = l1BodyRow(bodyMeasure, state.measurements.find((m) => m.label === ids.get("vertebrae_L1")), vol.dims[2],
+      { t12: present("vertebrae_T12"), l2: present("vertebrae_L2") });
+    renderOrgans(); renderLiver(); renderL3(); renderBone();
     tabs.style.display = "flex";
     showTab("organs");
     renderSaveRow();
@@ -741,7 +814,7 @@ export async function activate(host) {
       const res = await host.saveStructuredReport(target.tileId, {
         seriesDescription: "CT quantification (research)",
         documentTitle: `CT organ volume and body composition — ${modelText()} (research use only)`,
-        groups: srGroups(state.organs, state.l3.ok ? state.l3Rows : null, target),
+        groups: srGroups(state.organs, state.l3.ok ? state.l3Rows : null, target, state.l1),
         findings: [{ label: "Note", text: `Segmentation by ${modelText()}. Measured by GRAPHY-Next H66. Research use only; not for diagnosis.` }],
       });
       state.savedSr = res;
@@ -753,7 +826,7 @@ export async function activate(host) {
       const text = toCsv(state.organs, state.ls, state.l3.ok ? state.l3Rows : null, {
         model: "TotalSegmentator", version: state.summary.version, fast: state.summary.fast,
         seriesLabel: target.seriesLabel, l3k: state.l3.ok ? state.l3.k : null, heightCm: Number(height.value) > 0 ? Number(height.value) : null,
-      });
+      }, state.l1);
       const res = await host.file.saveAs({ defaultName: "ct-quant.csv", bytes: new TextEncoder().encode(text), filters: [{ name: "CSV", extensions: ["csv"] }] });
       state.savedCsv = res;
       if (res.ok) result.textContent = `CSV を保存しました（${res.filePath}）。`;
