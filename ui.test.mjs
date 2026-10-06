@@ -11,7 +11,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import {
-  MUSCLE_HU, TOTALSEG_VERSION, buildScript, combine, idsByName, l3Muscles, l3Slice, liverSpleen,
+  MUSCLE_HU, TOTALSEG_VERSION, buildScript, combine, idsByName, l1BodyRow, l3Muscles, l3Slice, liverSpleen, vertebraCut,
   mapSlices, organRows, parseNpy, reorderLabels, srGroups, toCsv,
 } from "./ui.js";
 
@@ -73,6 +73,24 @@ test("l3Slice accepts an L3 that touches the edge when L2 and L4 are both in the
   assert.deepEqual(l3Slice(m(29, 50, 300, { centroidLps: [0, 0, 43], kRange: [0, 13] }), vol, { l2: true, l4: true }), { ok: true, k: 9 });
 });
 
+test("vertebraCut trusts both neighbours and otherwise looks at the edges", () => {
+  assert.equal(vertebraCut({ kRange: [0, 9] }, 40, { above: true, below: true }), false);
+  assert.equal(vertebraCut({ kRange: [0, 9] }, 40, { above: true, below: false }), true);
+  assert.equal(vertebraCut({ kRange: [3, 9] }, 40, { above: false, below: false }), false);
+  assert.equal(vertebraCut({ kRange: [3, 39] }, 40, { above: false, below: true }), true);
+});
+
+test("l1BodyRow reports the vertebral body CT value and refuses a cut-off L1", () => {
+  const body = m(1, 400, 180, { eroded: { n: 120, mean: 150, sd: 20 } });
+  const l1 = m(31, 900, 300, { kRange: [5, 15] });
+  const r = l1BodyRow(body, l1, 40, { t12: true, l2: true });
+  assert.equal(r.ok, true);
+  assert.deepEqual([r.meanHu, r.erodedMeanHu, r.erodedVoxels, r.voxelCount], [180, 150, 120, 400]);
+  assert.equal(l1BodyRow(body, m(31, 900, 300, { kRange: [0, 15] }), 40, { t12: false, l2: true }).ok, false);
+  assert.equal(l1BodyRow(undefined, l1, 40, { t12: true, l2: true }).ok, false);
+  assert.equal(l1BodyRow(m(1, 0, NaN), l1, 40, { t12: true, l2: true }).ok, false);
+});
+
 test("l3Muscles sums left and right and divides by height squared", () => {
   const slice = (pixelCount, areaCm2, mean, muscle) => [{ k: 11, pixelCount, areaCm2, mean, rangeAreasCm2: { [MUSCLE_HU.name]: muscle } }];
   const ms = [
@@ -97,6 +115,10 @@ test("toCsv has a BOM, a model line and one row per structure", () => {
   assert.match(lines[0], /^# TotalSegmentator 2\.18\.0 \/ PRE LIVER \/ research use only$/);
   assert.equal(lines.length, 2 + organs.length + 1);
   assert.match(lines[2], /^organ,"肝臓",1\.50,55\.0,10\.0,56\.0,,,$/);
+  const withL1 = toCsv(organs, liverSpleen([m(1, 200, 45), m(5, 1500, 55)], CLASS_MAP), null,
+    { model: "TotalSegmentator", version: "2.18.0", fast: false, seriesLabel: "PRE LIVER", l3k: null, heightCm: null },
+    { ok: true, volumeMl: 30, voxelCount: 400, meanHu: 180, sdHu: 20, erodedMeanHu: 150, erodedVoxels: 120 });
+  assert.match(withL1, /^L1,"L1 vertebral body",30\.00,180\.0,20\.0,150\.0,,,\r?$/m);
 });
 
 test("srGroups skips values the SR cannot hold and uses UCUM units", () => {
@@ -108,6 +130,9 @@ test("srGroups skips values the SR cannot hold and uses UCUM units", () => {
   assert.deepEqual(g[1].measurements.map((x) => x.type), ["volume", "meanValue"], "合計の行は SD を出さない");
   assert.deepEqual(g[2].measurements.map((x) => x.type), ["area", "meanValue"]);
   for (const grp of g) for (const x of grp.measurements) assert.ok(Number.isFinite(x.value));
+  const g2 = srGroups(organs, null, { seriesUid: "1.2" }, { ok: true, volumeMl: 30, voxelCount: 400, meanHu: 180, sdHu: 20, erodedMeanHu: 150, erodedVoxels: 120 });
+  assert.deepEqual(g2.at(-1).measurements.map((x) => x.type), ["meanValue", "stdDev"]);
+  assert.match(g2.at(-1).findingText, /no BMD conversion/);
 });
 
 test("buildScript pins the version and passes the code inspector limits", () => {
@@ -134,7 +159,7 @@ class _Cuda:
 cuda = _Cuda()
 `,
   "totalsegmentator/__init__.py": "",
-  "totalsegmentator/map_to_binary.py": "class_map = {'total': {1: 'spleen', 2: 'kidney_right'}}\n",
+  "totalsegmentator/map_to_binary.py": "class_map = {'total': {1: 'spleen', 2: 'vertebrae_L1'}, 'vertebrae_body': {1: 'vertebrae_body', 2: 'intervertebral_discs'}}\n",
   "totalsegmentator/python_api.py": `
 import os
 import numpy as np
@@ -142,10 +167,14 @@ import nibabel as nib
 
 
 def totalsegmentator(input, output, ml=False, task='total', fast=False, quiet=False):
-    assert ml and task == 'total', (ml, task)
-    assert fast == (os.environ.get('WANT_FAST') == '1'), fast
+    assert ml and task in ('total', 'vertebrae_body'), (ml, task)
     img = nib.load(input)
     a = np.asanyarray(img.dataobj)
+    if task == 'vertebrae_body':
+        # 椎体 = 1500 を超えるところと 700 のところ（700 は L1 ではないので重なりに入らない）
+        nib.save(nib.Nifti1Image(((a > 1500) | (a == 700)).astype(np.uint8), img.affine), output)
+        return
+    assert fast == (os.environ.get('WANT_FAST') == '1'), fast
     lab = (a > 500).astype(np.uint8) + (a > 1500).astype(np.uint8)
     aff = img.affine
     if os.environ.get('FAKE_MODE') == 'flip':   # 保存の向きだけ x を反転（同じ場所を指す）
@@ -209,7 +238,13 @@ for (const mode of ["same", "flip"]) {
       assert.equal(summary.resampled, mode === "flip");
       assert.equal(summary.version, "2.18.0");
       assert.equal(summary.fast, mode === "flip");
-      assert.deepEqual(summary.classMap, { 1: "spleen", 2: "kidney_right" });
+      assert.deepEqual(summary.classMap, { 1: "spleen", 2: "vertebrae_L1" });
+      // L1 椎体 = vertebrae_L1（2000 の 1 ボクセル）と椎体（2000・700）の重なり → 1 ボクセルだけ
+      assert.equal(summary.l1BodyVoxels, 1);
+      const body = parseNpy(new Uint8Array(fs.readFileSync(path.join(run, "outputs", "l1body.npy"))));
+      assert.deepEqual(body.shape, [6, 7, 9]);
+      assert.equal([...body.data].reduce((a, v) => a + v, 0), 1);
+      assert.equal(body.data[4 * 63 + 5 * 9 + 7], 1, "[z=4, y=5, x=7] の目印");
       assert.deepEqual(summary.labels, { 0: 6 * 7 * 9 - 3, 1: 2, 2: 1 });
       assert.deepEqual(summary.gpu, { name: "Fake T4", peakMiB: 3 });
       // 本体の格子（スライスが逆順）へ写しても目印が同じ場所に来る
