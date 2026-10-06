@@ -11,7 +11,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import {
-  MUSCLE_HU, TOTALSEG_VERSION, buildScript, combine, idsByName, l1BodyRow, l3Muscles, l3Slice, liverSpleen, vertebraCut,
+  MUSCLE_HU, TOTALSEG_VERSION, buildScript, combine, idsByName, l1BodyRow, l3Muscles, l3Sma, l3Slice, liverSpleen, vertebraCut,
   mapSlices, organRows, parseNpy, reorderLabels, srGroups, toCsv,
 } from "./ui.js";
 
@@ -91,6 +91,23 @@ test("l1BodyRow reports the vertebral body CT value and refuses a cut-off L1", (
   assert.equal(l1BodyRow(m(1, 0, NaN), l1, 40, { t12: true, l2: true }).ok, false);
 });
 
+test("l3Sma sums the SMA muscles (left and right), skips other muscles and divides by height squared", () => {
+  const MM = { 1: "pectoralis_major_right", 3: "rectus_abdominis_right", 4: "rectus_abdominis_left", 19: "psoas_major_right", 20: "psoas_major_left", 7: "latissimus_dorsi_right" };
+  const sl = (pixelCount, areaCm2, mean, muscle) => [{ k: 9, pixelCount, areaCm2, mean, rangeAreasCm2: { [MUSCLE_HU.name]: muscle } }];
+  const ms = [m(3, 0, 0, { slices: sl(100, 5, 40, 4) }), m(4, 0, 0, { slices: sl(100, 5, 20, 5) }),
+    m(19, 0, 0, { slices: sl(200, 8, 50, 8) }), m(7, 0, 0, { slices: sl(500, 30, 45, 30) })];
+  const r = l3Sma(ms, MM, 160);
+  const rect = r.parts.find((x) => x.key === "rectus_abdominis");
+  assert.equal(rect.areaCm2, 10);
+  assert.equal(rect.meanHu, 30);
+  assert.equal(r.total.areaCm2, 18, "広背筋は SMA に入れない");
+  assert.equal(r.total.meanHu, (100 * 40 + 100 * 20 + 200 * 50) / 400);
+  assert.equal(r.total.muscleRangeAreaCm2, 17);
+  assert.ok(Math.abs(r.total.smiCm2PerM2 - 18 / 1.6 ** 2) < 1e-12);
+  assert.equal(r.parts.find((x) => x.key === "quadratus_lumborum").areaCm2, 0);
+  assert.ok(Number.isNaN(l3Sma(ms, MM, null).total.smiCm2PerM2));
+});
+
 test("l3Muscles sums left and right and divides by height squared", () => {
   const slice = (pixelCount, areaCm2, mean, muscle) => [{ k: 11, pixelCount, areaCm2, mean, rangeAreasCm2: { [MUSCLE_HU.name]: muscle } }];
   const ms = [
@@ -159,7 +176,7 @@ class _Cuda:
 cuda = _Cuda()
 `,
   "totalsegmentator/__init__.py": "",
-  "totalsegmentator/map_to_binary.py": "class_map = {'total': {1: 'spleen', 2: 'vertebrae_L1'}, 'vertebrae_body': {1: 'vertebrae_body', 2: 'intervertebral_discs'}}\n",
+  "totalsegmentator/map_to_binary.py": "class_map = {'total': {1: 'spleen', 2: 'vertebrae_L1'}, 'vertebrae_body': {1: 'vertebrae_body', 2: 'intervertebral_discs'}, 'abdominal_muscles': {19: 'psoas_major_right', 20: 'psoas_major_left'}}\n",
   "totalsegmentator/python_api.py": `
 import os
 import numpy as np
@@ -167,9 +184,13 @@ import nibabel as nib
 
 
 def totalsegmentator(input, output, ml=False, task='total', fast=False, quiet=False):
-    assert ml and task in ('total', 'vertebrae_body'), (ml, task)
+    assert ml and task in ('total', 'vertebrae_body', 'abdominal_muscles'), (ml, task)
     img = nib.load(input)
     a = np.asanyarray(img.dataobj)
+    if task == 'abdominal_muscles':
+        # 700 のところ = psoas_major_right（19）
+        nib.save(nib.Nifti1Image((a == 700).astype(np.uint8) * 19, img.affine), output)
+        return
     if task == 'vertebrae_body':
         # 椎体 = 1500 を超えるところと 700 のところ（700 は L1 ではないので重なりに入らない）
         nib.save(nib.Nifti1Image(((a > 1500) | (a == 700)).astype(np.uint8), img.affine), output)
@@ -245,6 +266,11 @@ for (const mode of ["same", "flip"]) {
       assert.deepEqual(body.shape, [6, 7, 9]);
       assert.equal([...body.data].reduce((a, v) => a + v, 0), 1);
       assert.equal(body.data[4 * 63 + 5 * 9 + 7], 1, "[z=4, y=5, x=7] の目印");
+      const mus = parseNpy(new Uint8Array(fs.readFileSync(path.join(run, "outputs", "muscles.npy"))));
+      assert.deepEqual(mus.shape, [6, 7, 9]);
+      assert.equal(mus.data[2 * 63 + 0 * 9 + 8], 19, "[z=2, y=0, x=8] の 700 が psoas_major_right");
+      assert.deepEqual(summary.muscleVoxels, { 19: 1 });
+      assert.deepEqual(summary.muscleMap, { 19: "psoas_major_right", 20: "psoas_major_left" });
       assert.deepEqual(summary.labels, { 0: 6 * 7 * 9 - 3, 1: 2, 2: 1 });
       assert.deepEqual(summary.gpu, { name: "Fake T4", peakMiB: 3 });
       // 本体の格子（スライスが逆順）へ写しても目印が同じ場所に来る

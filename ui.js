@@ -44,6 +44,20 @@ export const GROUPS = [
 ];
 
 export const L3 = "vertebrae_L3";
+/**
+ * L3 の骨格筋の全周の面積（SMA）に入れる筋（TotalSegmentator abdominal_muscles の名前・左右は合計）。
+ * 定義は大腰筋・傍脊柱筋（脊柱起立筋・腰方形筋）・腹横筋・外腹斜筋・内腹斜筋・腹直筋（PMC7359407 による。原典の Mourtzakis 2008 は未読）。
+ * 横突棘筋（多裂筋など）は傍脊柱筋として入れる。**腹横筋は abdominal_muscles に無いので入らない**（SMA は小さめに出る）。
+ */
+export const SMA_PARTS = [
+  ["psoas_major", "大腰筋"],
+  ["erector_spinae", "脊柱起立筋"],
+  ["transversospinalis", "横突棘筋"],
+  ["quadratus_lumborum", "腰方形筋"],
+  ["external_oblique", "外腹斜筋"],
+  ["internal_oblique", "内腹斜筋"],
+  ["rectus_abdominis", "腹直筋"],
+];
 export const PSOAS = ["iliopsoas_left", "iliopsoas_right"];
 export const PARASPINAL = ["autochthon_left", "autochthon_right"];
 
@@ -134,15 +148,19 @@ args = json.load(open(sys.argv[1], encoding='utf-8'))
 totalsegmentator(args['input'], args['output'], ml=True, task='total', fast=args['fast'], quiet=True)
 # 椎体だけ（椎弓を含まない）。L1 椎体の CT 値に使う。v2.18.0 ではライセンス不要（commercial_models に無い）
 totalsegmentator(args['input'], args['bodies'], ml=True, task='vertebrae_body', quiet=True)
+# 腹壁の筋を含む骨格筋（T4〜L4 の範囲だけ）。L3 の骨格筋の全周の面積に使う。v2.18.0 ではライセンス不要
+totalsegmentator(args['input'], args['muscles'], ml=True, task='abdominal_muscles', quiet=True)
 json.dump({'peakMiB': round(torch.cuda.max_memory_allocated() / 1048576),
            'gpu': torch.cuda.get_device_name(0),
            'classMap': {str(k): v for k, v in class_map['total'].items()},
-           'bodyMap': {str(k): v for k, v in class_map['vertebrae_body'].items()}}, open(sys.argv[2], 'w'))
+           'bodyMap': {str(k): v for k, v in class_map['vertebrae_body'].items()},
+           'muscleMap': {str(k): v for k, v in class_map['abdominal_muscles'].items()}}, open(sys.argv[2], 'w'))
 '''
 args_path = os.path.join(work, 'run-args.json')
 info_path = os.path.join(work, 'run-info.json')
 bodies_path = os.path.join(work, 'bodies.nii.gz')
-json.dump({'input': image_path, 'output': out_path, 'bodies': bodies_path, 'fast': FAST}, open(args_path, 'w', encoding='utf-8'))
+muscles_path = os.path.join(work, 'muscles.nii.gz')
+json.dump({'input': image_path, 'output': out_path, 'bodies': bodies_path, 'muscles': muscles_path, 'fast': FAST}, open(args_path, 'w', encoding='utf-8'))
 proc = subprocess.run([sys.executable, '-c', RUNNER, args_path, info_path], capture_output=True, encoding='utf-8', errors='replace',
                       env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
 if proc.stdout:
@@ -183,6 +201,8 @@ l1_id = {v: int(k) for k, v in info['classMap'].items()}.get('vertebrae_L1')
 body_id = {v: int(k) for k, v in info['bodyMap'].items()}['vertebrae_body']
 l1body = ((lab == l1_id) & (bodies == body_id)) if l1_id is not None else np.zeros(lab.shape, bool)
 np.save('outputs/l1body.npy', np.ascontiguousarray(l1body.transpose(2, 1, 0)).astype(np.uint8))
+muscles, resampled_m = to_input_grid(muscles_path)
+np.save('outputs/muscles.npy', np.ascontiguousarray(muscles.transpose(2, 1, 0)).astype(np.uint8))
 zyx = np.ascontiguousarray(lab.transpose(2, 1, 0))
 np.save('outputs/labels.npy', zyx.astype(np.uint8 if zyx.max() < 256 else np.uint16))
 values, counts = np.unique(zyx, return_counts=True)
@@ -196,7 +216,9 @@ json.dump({
     'labels': {str(int(v)): int(c) for v, c in zip(values, counts)},
     'shape': [int(nz), int(ny), int(nx)],
     'geometry': {'spacing': sp.tolist(), 'origin': org.tolist(), 'direction': dr.tolist()},
-    'resampled': bool(resampled or resampled_b),
+    'resampled': bool(resampled or resampled_b or resampled_m),
+    'muscleMap': info['muscleMap'],
+    'muscleVoxels': {str(int(v)): int(c) for v, c in zip(*np.unique(muscles[muscles > 0], return_counts=True))},
     'l1BodyVoxels': int(l1body.sum()),
     'stages': STAGES,
     'gpu': {'name': info['gpu'], 'peakMiB': info['peakMiB']},
@@ -494,6 +516,32 @@ export function l3Muscles(sliceMeasurements, classMap, heightCm) {
   return [part(PSOAS, "大腰筋（左右の合計）"), part(PARASPINAL, "脊柱起立筋（左右の合計）")];
 }
 
+/**
+ * L3 の骨格筋の全周の面積（SMA）。筋ごと（左右の合計）と合計。身長（cm）があれば SMA ÷ 身長²（SMI）。
+ * @param {any[]} sliceMeasurements H66 の結果（abdominal_muscles のラベル・slices に L3 の k を 1 つ）
+ * @param {Record<string, string>} muscleMap abdominal_muscles の class map
+ * @param {number | null} heightCm
+ */
+export function l3Sma(sliceMeasurements, muscleMap, heightCm) {
+  const ids = idsByName(muscleMap);
+  const h = heightCm && heightCm > 0 ? heightCm / 100 : null;
+  const sum = (ss) => {
+    const pixels = ss.reduce((a, x) => a + x.pixelCount, 0);
+    const areaCm2 = ss.reduce((a, x) => a + x.areaCm2, 0);
+    const meanHu = pixels > 0 ? ss.reduce((a, x) => a + (x.pixelCount > 0 ? x.mean * x.pixelCount : 0), 0) / pixels : NaN;
+    const muscleRangeAreaCm2 = ss.reduce((a, x) => a + (x.rangeAreasCm2?.[MUSCLE_HU.name] ?? 0), 0);
+    return { pixels, areaCm2, meanHu, muscleRangeAreaCm2 };
+  };
+  const all = [];
+  const parts = SMA_PARTS.map(([key, name]) => {
+    const ss = ["right", "left"].map((side) => sliceMeasurements.find((m) => m.label === ids.get(`${key}_${side}`))?.slices?.[0]).filter(Boolean);
+    all.push(...ss);
+    return { key, name, ...sum(ss) };
+  });
+  const total = sum(all);
+  return { parts, total: { ...total, smiCm2PerM2: h ? total.areaCm2 / (h * h) : NaN } };
+}
+
 const fmt = (v, d = 1) => (Number.isFinite(v) ? v.toFixed(d) : "");
 
 /**
@@ -503,7 +551,7 @@ const fmt = (v, d = 1) => (Number.isFinite(v) ? v.toFixed(d) : "");
  * @param {ReturnType<typeof l3Muscles> | null} l3
  * @param {{ model: string, version: string, fast: boolean, seriesLabel: string, l3k: number | null, heightCm: number | null }} meta
  */
-export function toCsv(organs, ls, l3, meta, l1 = null) {
+export function toCsv(organs, ls, l3, meta, l1 = null, sma = null) {
   const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
   const lines = [
     `# ${meta.model} ${meta.version}${meta.fast ? " (fast)" : ""} / ${meta.seriesLabel} / research use only`,
@@ -512,6 +560,10 @@ export function toCsv(organs, ls, l3, meta, l1 = null) {
     ["liver_spleen", q("liver - spleen (HU)"), "", fmt(ls.liverMinusSpleenHu), "", "", "", "", ""].join(","),
     ...(l3 ?? []).map((r) => ["L3", q(r.name), "", fmt(r.meanHu), "", "", fmt(r.areaCm2, 2), fmt(r.muscleRangeAreaCm2, 2), fmt(r.indexCm2PerM2, 2)].join(",")),
     ...(l1 && l1.ok ? [["L1", q("L1 vertebral body"), fmt(l1.volumeMl, 2), fmt(l1.meanHu), fmt(l1.sdHu), fmt(l1.erodedMeanHu), "", "", ""].join(",")] : []),
+    ...(sma ? [
+      ...sma.parts.map((r) => ["L3_SMA_part", q(r.key), "", fmt(r.meanHu), "", "", fmt(r.areaCm2, 2), fmt(r.muscleRangeAreaCm2, 2), ""].join(",")),
+      ["L3_SMA", q("skeletal muscle area without transversus abdominis"), "", fmt(sma.total.meanHu), "", "", fmt(sma.total.areaCm2, 2), fmt(sma.total.muscleRangeAreaCm2, 2), fmt(sma.total.smiCm2PerM2, 2)].join(","),
+    ] : []),
   ];
   if (meta.l3k != null) lines.push(`# L3 slice index k=${meta.l3k}${meta.heightCm ? ` / height ${meta.heightCm} cm` : ""}`);
   return "﻿" + lines.join("\r\n") + "\r\n";
@@ -523,7 +575,7 @@ export function toCsv(organs, ls, l3, meta, l1 = null) {
  * @param {ReturnType<typeof l3Muscles> | null} l3
  * @param {{ seriesUid: string }} target
  */
-export function srGroups(organs, l3, target, l1 = null) {
+export function srGroups(organs, l3, target, l1 = null, sma = null) {
   const HU = "[hnsf'U]";
   const groups = [];
   for (const r of organs) {
@@ -537,6 +589,11 @@ export function srGroups(organs, l3, target, l1 = null) {
     const measurements = [{ type: "area", value: r.areaCm2, unit: "cm2" }];
     if (Number.isFinite(r.meanHu)) measurements.push({ type: "meanValue", value: r.meanHu, unit: HU });
     groups.push({ trackingId: `L3 ${r.name}`, findingText: `L3 level: ${r.name}`, seriesInstanceUid: target.seriesUid, measurements });
+  }
+  if (sma && sma.total.areaCm2 > 0) {
+    const measurements = [{ type: "area", value: sma.total.areaCm2, unit: "cm2" }];
+    if (Number.isFinite(sma.total.meanHu)) measurements.push({ type: "meanValue", value: sma.total.meanHu, unit: HU });
+    groups.push({ trackingId: "L3 skeletal muscle area", findingText: "L3 level: skeletal muscle area (TotalSegmentator abdominal_muscles; transversus abdominis not included)", seriesInstanceUid: target.seriesUid, measurements });
   }
   if (l1 && l1.ok && Number.isFinite(l1.meanHu)) {
     const measurements = [{ type: "meanValue", value: l1.meanHu, unit: HU }];
@@ -657,13 +714,21 @@ export async function activate(host) {
     }
     const h = Number(height.value);
     state.l3Rows = l3Muscles(state.l3Measure, state.classMap, h > 0 ? h : null);
+    state.sma = l3Sma(state.smaMeasure ?? [], state.summary.muscleMap, h > 0 ? h : null);
     const canvas = el("canvas", { testid: "ctq-l3-preview", style: "max-width: 100%; border: 1px solid #ccd" });
     drawSlice(canvas, state.l3.k);
     panes.l3.replaceChildren(
       el("div", {}, `L3 椎体の重心の高さ（スライス k = ${state.l3.k}）`),
       table(["構造", "面積 cm²", "平均 HU", `うち ${MUSCLE_HU.min}〜${MUSCLE_HU.max} HU の面積 cm²`, "面積 ÷ 身長² cm²/m²"],
         state.l3Rows.map((r) => [r.name, fmt(r.areaCm2, 2), fmt(r.meanHu), fmt(r.muscleRangeAreaCm2, 2), fmt(r.indexCm2PerM2, 2)])),
-      el("div", { style: "font-size: 11px; color: #52606d", textContent: "面積は画素の数え上げ × 画素面積です。基準値による判定はしていません。皮下脂肪・内臓脂肪・骨格筋の全周の面積は、オープンな重みでは出せないため出していません。" }),
+      el("div", { style: "font-weight: bold; margin-top: 8px", textContent: "骨格筋の全周（SMA・腹横筋を除く）" }),
+      table(["筋（左右の合計）", "面積 cm²", "平均 HU", `うち ${MUSCLE_HU.min}〜${MUSCLE_HU.max} HU の面積 cm²`],
+        [...state.sma.parts.map((r) => [r.name, fmt(r.areaCm2, 2), fmt(r.meanHu), fmt(r.muscleRangeAreaCm2, 2)]),
+          ["合計（SMA）", fmt(state.sma.total.areaCm2, 2), fmt(state.sma.total.meanHu), fmt(state.sma.total.muscleRangeAreaCm2, 2)]]),
+      el("div", { testid: "ctq-smi", textContent: `SMA ÷ 身長²（SMI）: ${Number.isFinite(state.sma.total.smiCm2PerM2) ? state.sma.total.smiCm2PerM2.toFixed(2) + " cm²/m²" : "身長を入れると出ます"}` }),
+      el("div", { style: "font-size: 11px; color: #52606d", textContent:
+        "面積は画素の数え上げ × 画素面積です。基準値による判定はしていません。SMA の定義（大腰筋・傍脊柱筋・腰方形筋・腹横筋・外腹斜筋・内腹斜筋・腹直筋）のうち、" +
+        "腹横筋は TotalSegmentator abdominal_muscles に無いので入っておらず、文献の SMA より小さく出ます。abdominal_muscles は小さい別のデータで学習したモデルです（頑健さは total より劣ると作者が注記）。皮下脂肪・内臓脂肪は、使えるモデルが商用ライセンス制なので出していません。" }),
       canvas);
   }
   height.addEventListener("input", () => { if (state.l3) renderL3(); });
@@ -685,14 +750,18 @@ export async function activate(host) {
     const nxy = nx * ny;
     const ids = idsByName(state.classMap);
     const show = new Set([...PSOAS, ...PARASPINAL].map((n) => ids.get(n)));
+    // 重ね表示は SMA の筋（abdominal_muscles）を優先する。無ければ total の大腰筋・脊柱起立筋
+    const mids = idsByName(state.summary.muscleMap);
+    const smaIds = new Set(SMA_PARTS.flatMap(([key]) => ["right", "left"].map((side) => mids.get(`${key}_${side}`))));
     canvas.width = nx; canvas.height = ny;
     const ctx = /** @type {CanvasRenderingContext2D} */ (canvas.getContext("2d"));
     const im = ctx.createImageData(nx, ny);
     const lo = 40 - 200, hi = 40 + 200;   // 腹部の窓（HU 40±200）
     for (let p = 0; p < nxy; p++) {
       const g = Math.max(0, Math.min(255, ((vol.data[k * nxy + p] - lo) / (hi - lo)) * 255));
+      const mv = state.muscles ? state.muscles[k * nxy + p] : 0;
       const v = data[k * nxy + p];
-      const c = show.has(v) ? colorFor(v) : null;
+      const c = smaIds.has(mv) ? colorFor(mv + 200) : show.has(v) ? colorFor(v) : null;
       im.data[p * 4] = c ? (g + c[0]) / 2 : g;
       im.data[p * 4 + 1] = c ? (g + c[1]) / 2 : g;
       im.data[p * 4 + 2] = c ? (g + c[2]) / 2 : g;
@@ -728,8 +797,8 @@ export async function activate(host) {
       busy(false);
       return;
     }
-    const [lj, ln, lb] = await Promise.all([r.readFile("labels.json"), r.readFile("labels.npy"), r.readFile("l1body.npy")]);
-    if (!lj || !ln || !lb) { setStatus("失敗: 結果が返りませんでした"); busy(false); return; }
+    const [lj, ln, lb, lm] = await Promise.all([r.readFile("labels.json"), r.readFile("labels.npy"), r.readFile("l1body.npy"), r.readFile("muscles.npy")]);
+    if (!lj || !ln || !lb || !lm) { setStatus("失敗: 結果が返りませんでした"); busy(false); return; }
     const summary = JSON.parse(new TextDecoder().decode(lj));
     const npy = parseNpy(ln);
     setStatus("ボリュームを読み込んでいます…");
@@ -763,6 +832,12 @@ export async function activate(host) {
     state.l1BodyMeasure = bodyMeasure ?? null;
     state.l1 = l1BodyRow(bodyMeasure, state.measurements.find((m) => m.label === ids.get("vertebrae_L1")), vol.dims[2],
       { t12: present("vertebrae_T12"), l2: present("vertebrae_L2") });
+    // 骨格筋（abdominal_muscles・別のラベルの volume）。L3 が測れるときだけ、そのスライスで測る
+    state.muscles = reorderLabels(/** @type {any} */ (parseNpy(lm).data), mapped.kMap, vol.dims[0] * vol.dims[1]);
+    if (state.l3.ok) {
+      const mids = Object.keys(summary.muscleMap).map(Number);
+      state.smaMeasure = host.measureLabels({ data: state.muscles, dims: vol.dims, indexToWorld: vol.indexToWorld }, vol, { labels: mids, slices: [state.l3.k], valueRanges: [MUSCLE_HU] });
+    }
     renderOrgans(); renderLiver(); renderL3(); renderBone();
     tabs.style.display = "flex";
     showTab("organs");
@@ -814,7 +889,7 @@ export async function activate(host) {
       const res = await host.saveStructuredReport(target.tileId, {
         seriesDescription: "CT quantification (research)",
         documentTitle: `CT organ volume and body composition — ${modelText()} (research use only)`,
-        groups: srGroups(state.organs, state.l3.ok ? state.l3Rows : null, target, state.l1),
+        groups: srGroups(state.organs, state.l3.ok ? state.l3Rows : null, target, state.l1, state.l3.ok ? state.sma : null),
         findings: [{ label: "Note", text: `Segmentation by ${modelText()}. Measured by GRAPHY-Next H66. Research use only; not for diagnosis.` }],
       });
       state.savedSr = res;
@@ -826,7 +901,7 @@ export async function activate(host) {
       const text = toCsv(state.organs, state.ls, state.l3.ok ? state.l3Rows : null, {
         model: "TotalSegmentator", version: state.summary.version, fast: state.summary.fast,
         seriesLabel: target.seriesLabel, l3k: state.l3.ok ? state.l3.k : null, heightCm: Number(height.value) > 0 ? Number(height.value) : null,
-      }, state.l1);
+      }, state.l1, state.l3.ok ? state.sma : null);
       const res = await host.file.saveAs({ defaultName: "ct-quant.csv", bytes: new TextEncoder().encode(text), filters: [{ name: "CSV", extensions: ["csv"] }] });
       state.savedCsv = res;
       if (res.ok) result.textContent = `CSV を保存しました（${res.filePath}）。`;
